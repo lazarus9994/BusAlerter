@@ -1,13 +1,15 @@
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class GtfsData {
 
+    private final Map<String, List<ShapePoint>> shapesCache = new HashMap<>();
+    private final Map<String, String> tripShapeCache = new HashMap<>();
+    private final Map<String, ShapePoint> stopPointCache = new HashMap<>();
     private final Set<String> tripIds;
     private final Set<String> tripsAtStop;
     private final double stopLatitude;
@@ -28,6 +30,16 @@ public class GtfsData {
 
         Path stopTimesFile = Path.of("gtfs", "stop_times.txt");
 
+        try (var lines = Files.lines(tripsFile)) {
+
+            lines
+                    .skip(1)
+                    .map(line -> line.split(","))
+                    .filter(fields -> fields[1].equals("A101"))
+                    .forEach(fields ->
+                            tripShapeCache.put(fields[0], fields[7])
+                    );
+        }
 
         try (var lines = Files.lines(stopTimesFile)) {
 
@@ -95,6 +107,7 @@ public class GtfsData {
 
         Path stopTimesFile = Path.of("gtfs", "stop_times.txt");
 
+
         try (var lines = Files.lines(stopTimesFile)) {
 
             Set<String> trips = lines
@@ -138,11 +151,15 @@ public class GtfsData {
 
     public List<ShapePoint> getShape(String shapeId) throws IOException {
 
+        if (shapesCache.containsKey(shapeId)) {
+            return shapesCache.get(shapeId);
+        }
+
         Path shapesFile = Path.of("gtfs", "shapes.txt");
 
         try (var lines = Files.lines(shapesFile)) {
 
-            return lines
+            List<ShapePoint> shape = lines
                     .skip(1)
                     .map(line -> line.split(","))
                     .filter(fields -> fields[0].equals(shapeId))
@@ -153,6 +170,10 @@ public class GtfsData {
                     ))
                     .sorted(Comparator.comparingInt(ShapePoint::sequence))
                     .toList();
+
+            shapesCache.put(shapeId, shape);
+
+            return shape;
         }
     }
 
@@ -195,28 +216,36 @@ public class GtfsData {
             double busLat,
             double busLon) throws IOException {
 
-        return getShape(shapeId).stream()
-                .min(Comparator.comparingDouble(point ->
-                        distance(
-                                busLat,
-                                busLon,
-                                point.latitude(),
-                                point.longitude()
-                        )
-                ))
-                .orElse(null);
-    }
+        List<ShapePoint> shape = getShape(shapeId);
 
-    public ShapePoint getShapePointAtStop(
-            String shapeId,
-            String stopId) throws IOException {
+        ShapePoint nearest = null;
+        double minDistance = Double.MAX_VALUE;
 
-        // Засега използваме координатите на спирката
-        if (!stopId.equals("A0964")) {
-            return null;
+        for (ShapePoint point : shape) {
+
+            double currentDistance = distance(
+                    busLat,
+                    busLon,
+                    point.latitude(),
+                    point.longitude()
+            );
+
+            if (currentDistance < minDistance) {
+                minDistance = currentDistance;
+                nearest = point;
+            }
         }
 
-        return getShape(shapeId).stream()
+        return nearest;
+    }
+
+    public ShapePoint getShapePointAtStop(String shapeId, String stopId) throws IOException {
+
+        if (stopPointCache.containsKey(shapeId)) {
+            return stopPointCache.get(shapeId);
+        }
+
+        ShapePoint nearest = getShape(shapeId).stream()
                 .min(Comparator.comparingDouble(point ->
                         distance(
                                 stopLatitude,
@@ -226,6 +255,20 @@ public class GtfsData {
                         )
                 ))
                 .orElse(null);
+
+        if (nearest != null &&
+                distance(
+                        stopLatitude,
+                        stopLongitude,
+                        nearest.latitude(),
+                        nearest.longitude()
+                ) < 30) {
+
+            stopPointCache.put(shapeId, nearest);
+            return nearest;
+        }
+
+        return null;
     }
 
     private double distance(
@@ -234,11 +277,22 @@ public class GtfsData {
             double lat2,
             double lon2) {
 
-        double dLat = lat2 - lat1;
-        double dLon = lon2 - lon1;
+        final double EARTH_RADIUS = 6_371_000; // метри
 
-        return Math.sqrt(dLat * dLat + dLon * dLon);
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLon = Math.toRadians(lon2 - lon1);
+
+        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                + Math.cos(Math.toRadians(lat1))
+                * Math.cos(Math.toRadians(lat2))
+                * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+
+        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+        return EARTH_RADIUS * c;
     }
+
+
 
     public double distanceToStop(String shapeId, double busLat, double busLon) throws IOException {
         ShapePoint nearest = getNearestShapePoint(shapeId, busLat, busLon);
@@ -283,19 +337,62 @@ public class GtfsData {
         return BusStatus.AT_STOP;
     }
 
-    public String getShapeIdForTrip(String tripId) throws IOException {
+    public String getShapeIdForTrip(String tripId) {
+        return tripShapeCache.get(tripId);
+    }
 
-        Path tripsFile = Path.of("gtfs", "trips.txt");
 
-        try (var lines = Files.lines(tripsFile)) {
+    public String getArrivalTime(String tripId, String stopId) throws IOException {
 
-            return lines
-                    .skip(1)
-                    .map(line -> line.split(","))
-                    .filter(fields -> fields[0].equals(tripId))
-                    .map(fields -> fields[7])
+        Path stopTimesFile = Path.of("gtfs", "stop_times.txt");
+
+        try (Stream<String> lines = Files.lines(stopTimesFile)) {
+
+            return lines.skip(1)
+                    .map(line -> line.split(",", -1))
+                    .filter(parts -> parts.length > 3)
+                    .filter(parts -> parts[0].equals(tripId))
+                    .filter(parts -> parts[3].equals(stopId))
+                    .map(parts -> parts[1])
                     .findFirst()
                     .orElse(null);
         }
+    }
+
+    public double distanceAlongShape(
+            String shapeId,
+            int fromSequence,
+            int toSequence) throws IOException {
+
+        List<ShapePoint> shape = getShape(shapeId);
+
+        if (fromSequence >= toSequence) {
+            return 0;
+        }
+
+        double totalDistance = 0;
+
+        for (int i = 1; i < shape.size(); i++) {
+
+            ShapePoint previous = shape.get(i - 1);
+            ShapePoint current = shape.get(i);
+
+            if (current.sequence() <= fromSequence) {
+                continue;
+            }
+
+            if (current.sequence() > toSequence) {
+                break;
+            }
+
+            totalDistance += distance(
+                    previous.latitude(),
+                    previous.longitude(),
+                    current.latitude(),
+                    current.longitude()
+            );
+        }
+
+        return totalDistance;
     }
 }
